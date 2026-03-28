@@ -4,13 +4,15 @@ Composer package **`edzero/license-client`**: activation UI (`/license/activate`
 
 Used by the main EDZero app via path repository ([`composer.json`](../../composer.json)). Config is merged from [`config/license-client.php`](config/license-client.php) (publish with `php artisan vendor:publish --tag=license-client-config` if you need overrides).
 
+**Keys:** this package does not ship or generate RSA material. Install the two **public** keys from your license-server operator (created by `license-server/scripts/generate-keys.sh` → `client-keys/`). Never put server **private** keys in the app.
+
 ## Documentation map
 
 | Doc | Content |
 |-----|---------|
 | [EDZero root `README.md`](../../README.md) | Docker, `EnforceLicenseWhenConfigured`, first-time license setup |
-| [`License/README.md`](../README.md) | Keys, server API, customer-facing checklist |
-| [`License/license-server/README.md`](../license-server/README.md) | Verify/generate API, server env |
+| [`license/README.md`](../README.md) | Keys, server API, customer-facing checklist |
+| [`license/license-server/README.md`](../license-server/README.md) | Verify/generate API, server env |
 
 ## Environment variables (app `.env` / `.env.local` / `.env.prod`)
 
