@@ -28,16 +28,19 @@ Used by the main EDZero app via path repository ([`composer.json`](../../compose
 | `LICENSE_STATUS_FILE` | JSON path for activated state (default `storage/app/private/license.json`). |
 | `LICENSE_REQUEST_HMAC_SECRET` | Optional; must match license-server when HMAC is enabled there. |
 | `LICENSE_LOCAL_HMAC_SECRET` | HMAC over stored status (defaults to `APP_KEY`). |
-| `LICENSE_VERIFY_TIMEOUT` | HTTP timeout seconds (default 10). |
+| `LICENSE_VERIFY_TIMEOUT` | HTTP timeout in seconds for **both** verify and heartbeat requests (default 10). Config key `license-client.request_timeout`. |
 | `LICENSE_CLOCK_SKEW_SECONDS` | Allowed skew when checking token `expires_at` (default 120). |
-| `LICENSE_DEVICE_FINGERPRINT` | Optional stable override for activation device id (max 128 chars). |
+| `LICENSE_DEVICE_FINGERPRINT` | Optional stable override for activation device id (max 128 chars). If unset, the default hash uses `php_uname('n')`, which can differ between **php-fpm** and **`php artisan`** on the same app — after activation, the fingerprint used at verify is stored in `LICENSE_STATUS_FILE` so **heartbeat** matches without this override. Re-run **activate** once after upgrading `license-client` if your `license.json` has no `device_fingerprint` key yet. |
+| `LICENSE_HEARTBEAT_ENABLED` | When **true** with enforcement on, HTTP access requires a fresh **`last_heartbeat_at`** (see **`LICENSE_HEARTBEAT_MAX_STALE_HOURS`**). Run **`php artisan license:heartbeat`** daily via **`schedule:run`**. |
+| `LICENSE_HEARTBEAT_URL` | Optional; default = same host as verify URL with path **`/api/license/heartbeat`**. |
+| `LICENSE_HEARTBEAT_MAX_STALE_HOURS` | After this many hours without a successful heartbeat, the gate treats the license as invalid (default **48**). |
 
 Templates in the monorepo: [`.env.example`](../../.env.example), [`.env.local.example`](../../.env.local.example), [`.env.prod.example`](../../.env.prod.example).
 
 ## Commands & routes
 
 - Web: `GET|POST /license/activate` (package routes, `web` middleware).
-- CLI: `php artisan license:activate` (no-op message if enforcement is off).
+- CLI: `php artisan license:activate`, `php artisan license:heartbeat` (heartbeat skips when disabled or enforcement off).
 
 ## Middleware
 
