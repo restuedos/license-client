@@ -14,6 +14,11 @@ use Throwable;
 class LicenseService
 {
     /**
+     * Must match license-server `App\Support\LicenseApiResponse::INVALIDATE_APP_LICENSE` JSON key.
+     */
+    private const JSON_KEY_INVALIDATE_APP_LICENSE = 'invalidate_app_license';
+
+    /**
      * When false, {@see EnsureLicenseIsValid} does not block requests (no verify URL configured
      * or enforcement explicitly disabled). Activation is still available if a URL is set.
      */
@@ -55,7 +60,247 @@ class LicenseService
             return false;
         }
 
-        return $this->claimsAreUsable($claims);
+        if (! $this->claimsAreUsable($claims)) {
+            return false;
+        }
+
+        return $this->isHeartbeatFresh($status);
+    }
+
+    /**
+     * POST /api/license/heartbeat — confirms license row is still active (revoke takes effect on next success).
+     *
+     * @return array{ok: bool, message: string, data: array<string, mixed>}
+     */
+    public function runHeartbeat(): array
+    {
+        if (! $this->shouldEnforce() || ! $this->heartbeatEnabled()) {
+            return [
+                'ok' => true,
+                'message' => 'Heartbeat dinonaktifkan atau enforcement lisensi mati.',
+                'data' => [],
+            ];
+        }
+
+        if ($this->resolvedLocalHmacSecret() === '') {
+            return [
+                'ok' => false,
+                'message' => 'LICENSE_LOCAL_HMAC_SECRET atau APP_KEY wajib diisi.',
+                'data' => [],
+            ];
+        }
+
+        $status = $this->readStatus();
+
+        if (! $this->verifyLocalIntegrity($status)) {
+            return [
+                'ok' => false,
+                'message' => 'Status lisensi korup atau belum diaktivasi.',
+                'data' => [],
+            ];
+        }
+
+        $licenseToken = Arr::get($status, 'license_token');
+        $signature = Arr::get($status, 'signature');
+
+        if (! is_string($licenseToken) || ! is_string($signature)) {
+            return [
+                'ok' => false,
+                'message' => 'Belum ada token lisensi. Aktivasi terlebih dahulu.',
+                'data' => [],
+            ];
+        }
+
+        $claims = $this->verifyServerSignatureAndDecode($licenseToken, $signature);
+        if ($claims === null || ! $this->claimsAreUsable($claims)) {
+            return [
+                'ok' => false,
+                'message' => 'Token lisensi tidak valid atau sudah expired — aktivasi ulang.',
+                'data' => [],
+            ];
+        }
+
+        $url = $this->resolvedHeartbeatUrl();
+        if ($url === '') {
+            return [
+                'ok' => false,
+                'message' => 'LICENSE_HEARTBEAT_URL atau LICENSE_VERIFY_URL wajib diisi untuk heartbeat.',
+                'data' => [],
+            ];
+        }
+
+        $this->assertLicenseServerHostAllowedForUrl($url);
+
+        $timestamp = Carbon::now()->toIso8601String();
+        $nonce = bin2hex(random_bytes(16));
+
+        $requestPayload = [
+            'license_token' => $licenseToken,
+            'signature' => $signature,
+            'app_url' => (string) config('app.url'),
+            'environment' => (string) config('app.env'),
+            'timestamp' => $timestamp,
+            'nonce' => $nonce,
+            'device_fingerprint' => $this->resolveStoredOrLiveDeviceFingerprint($status),
+        ];
+
+        $requestSignature = $this->signHeartbeatRequest($requestPayload);
+        if ($requestSignature !== null) {
+            $requestPayload['request_signature'] = $requestSignature;
+        }
+
+        try {
+            $response = Http::timeout($this->licenseServerRequestTimeoutSeconds())
+                ->acceptJson()
+                ->post($url, $requestPayload);
+        } catch (ConnectionException $e) {
+            return [
+                'ok' => false,
+                'message' => 'Tidak dapat menghubungi license server untuk heartbeat.',
+                'data' => ['exception' => $e->getMessage()],
+            ];
+        }
+
+        $interpreted = $this->interpretHeartbeatResponse($response);
+        if (! $interpreted['ok']) {
+            return $this->applyServerInvalidateAppLicenseFlag($interpreted);
+        }
+
+        $status['last_heartbeat_at'] = Carbon::now()->toIso8601String();
+        $this->writeStatus($status);
+
+        return [
+            'ok' => true,
+            'message' => (string) Arr::get($interpreted['body'], 'message', 'Heartbeat berhasil.'),
+            'data' => $interpreted['body'],
+        ];
+    }
+
+    private function heartbeatEnabled(): bool
+    {
+        return (bool) config('license-client.heartbeat_enabled', false);
+    }
+
+    private function resolvedHeartbeatUrl(): string
+    {
+        $configured = trim((string) config('license-client.heartbeat_url'));
+        if ($configured !== '') {
+            return $configured;
+        }
+
+        $verify = trim((string) config('license-client.verify_url'));
+        if ($verify === '') {
+            return '';
+        }
+
+        $base = rtrim($verify, '/');
+        if (str_ends_with($base, '/verify')) {
+            return substr($base, 0, -strlen('/verify')).'/heartbeat';
+        }
+
+        return $base.'/heartbeat';
+    }
+
+    /**
+     * @param  array<string, mixed>  $status
+     */
+    private function isHeartbeatFresh(array $status): bool
+    {
+        if (! $this->heartbeatEnabled()) {
+            return true;
+        }
+
+        $maxStaleHours = max(1, (int) config('license-client.heartbeat_max_stale_hours', 48));
+        $ref = Arr::get($status, 'last_heartbeat_at');
+        if (! is_string($ref) || $ref === '') {
+            $ref = Arr::get($status, 'verified_at');
+        }
+        if (! is_string($ref) || $ref === '') {
+            return false;
+        }
+
+        try {
+            $at = Carbon::parse($ref);
+        } catch (Throwable) {
+            return false;
+        }
+
+        return $at->greaterThanOrEqualTo(Carbon::now()->subHours($maxStaleHours));
+    }
+
+    /**
+     * @return array{ok: true, body: array<string, mixed>}|array{ok: false, message: string, data: array<string, mixed>}
+     */
+    private function interpretHeartbeatResponse(Response $response): array
+    {
+        $body = $this->decodeLicenseVerifyResponseBody($response);
+
+        if (array_key_exists('valid', $body)) {
+            if (! (bool) Arr::get($body, 'valid')) {
+                return [
+                    'ok' => false,
+                    'message' => (string) Arr::get($body, 'message', 'Heartbeat ditolak oleh license server.'),
+                    'data' => array_merge($body, ['http_status' => $response->status()]),
+                ];
+            }
+
+            return ['ok' => true, 'body' => $body];
+        }
+
+        if ($response->failed() && isset($body['errors']) && is_array($body['errors'])) {
+            $flattened = Arr::flatten($body['errors']);
+            $first = $flattened !== [] && is_string($flattened[0]) ? $flattened[0] : null;
+            $message = is_string($first) && $first !== ''
+                ? $first
+                : (string) ($body['message'] ?? 'Permintaan heartbeat ditolak.');
+
+            return [
+                'ok' => false,
+                'message' => $message,
+                'data' => array_merge($body, ['http_status' => $response->status()]),
+            ];
+        }
+
+        if ($response->failed() || $body === []) {
+            return [
+                'ok' => false,
+                'message' => 'License heartbeat API gagal merespons dengan sukses.',
+                'data' => [
+                    'status' => $response->status(),
+                    'response' => $body !== [] ? $body : $response->body(),
+                ],
+            ];
+        }
+
+        return [
+            'ok' => false,
+            'message' => 'Response heartbeat tidak dikenali.',
+            'data' => ['http_status' => $response->status(), 'body' => $body],
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     */
+    private function signHeartbeatRequest(array $payload): ?string
+    {
+        $secret = (string) config('license-client.request_hmac_secret');
+
+        if ($secret === '') {
+            return null;
+        }
+
+        $data = implode('|', [
+            (string) Arr::get($payload, 'license_token', ''),
+            (string) Arr::get($payload, 'signature', ''),
+            (string) Arr::get($payload, 'app_url', ''),
+            (string) Arr::get($payload, 'environment', ''),
+            (string) Arr::get($payload, 'timestamp', ''),
+            (string) Arr::get($payload, 'nonce', ''),
+            (string) Arr::get($payload, 'device_fingerprint', ''),
+        ]);
+
+        return hash_hmac('sha256', $data, $secret);
     }
 
     /**
@@ -90,7 +335,7 @@ class LicenseService
         }
 
         try {
-            $response = Http::timeout((int) config('license-client.request_timeout', 10))
+            $response = Http::timeout($this->licenseServerRequestTimeoutSeconds())
                 ->acceptJson()
                 ->post($verifyUrl, $requestPayload);
         } catch (ConnectionException $e) {
@@ -105,7 +350,7 @@ class LicenseService
 
         $interpreted = $this->interpretLicenseVerifyResponse($response);
         if (! $interpreted['ok']) {
-            return $interpreted;
+            return $this->applyServerInvalidateAppLicenseFlag($interpreted);
         }
 
         /** @var array<string, mixed> $body */
@@ -131,9 +376,13 @@ class LicenseService
             ];
         }
 
+        $now = Carbon::now()->toIso8601String();
+        $deviceFingerprint = $this->deviceFingerprint();
         $status = [
             'verified' => true,
-            'verified_at' => Carbon::now()->toIso8601String(),
+            'verified_at' => $now,
+            'last_heartbeat_at' => $now,
+            'device_fingerprint' => $deviceFingerprint,
             'license_token' => $licenseToken,
             'signature' => $signature,
             'claims' => $claims,
@@ -225,6 +474,28 @@ class LicenseService
         $parsed = json_decode($raw, true);
 
         return is_array($parsed) ? $parsed : [];
+    }
+
+    /**
+     * @param  array{ok: false, message: string, data?: array<string, mixed>}  $interpreted
+     * @return array{ok: false, message: string, data?: array<string, mixed>}
+     */
+    private function applyServerInvalidateAppLicenseFlag(array $interpreted): array
+    {
+        $data = $interpreted['data'] ?? [];
+        if (Arr::get($data, self::JSON_KEY_INVALIDATE_APP_LICENSE) === true) {
+            $this->clearLicenseStatusFile();
+            $interpreted['message'] = trim(
+                ($interpreted['message'] ?? '').' Status lisensi lokal telah dihapus; silakan aktivasi ulang.'
+            );
+        }
+
+        return $interpreted;
+    }
+
+    private function licenseServerRequestTimeoutSeconds(): int
+    {
+        return max(1, (int) config('license-client.request_timeout', 10));
     }
 
     private function resolvedLocalHmacSecret(): string
@@ -427,6 +698,8 @@ class LicenseService
             File::makeDirectory($directory, 0755, true);
         }
 
+        // Never include a previous local_hmac in the signed payload (e.g. after readStatus + heartbeat update).
+        unset($status['local_hmac']);
         $status['local_hmac'] = $this->makeLocalHmac($status);
         File::put($path, json_encode($status, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     }
@@ -467,6 +740,17 @@ class LicenseService
         return (string) config('license-client.status_file');
     }
 
+    /**
+     * Remove signed license state so {@see isVerified()} fails until the user activates again.
+     */
+    private function clearLicenseStatusFile(): void
+    {
+        $path = $this->statusFilePath();
+        if ($path !== '' && File::exists($path)) {
+            File::delete($path);
+        }
+    }
+
     private function currentEnvironmentBucket(): string
     {
         $e = strtolower(trim((string) config('app.env')));
@@ -488,5 +772,21 @@ class LicenseService
             (string) config('app.env'),
             php_uname('n'),
         ]));
+    }
+
+    /**
+     * Use fingerprint persisted at activation so CLI (e.g. `license:heartbeat`) matches web activation
+     * even when {@see php_uname} differs between php-fpm and artisan.
+     *
+     * @param  array<string, mixed>  $status
+     */
+    private function resolveStoredOrLiveDeviceFingerprint(array $status): string
+    {
+        $stored = Arr::get($status, 'device_fingerprint');
+        if (is_string($stored) && $stored !== '') {
+            return substr($stored, 0, 128);
+        }
+
+        return $this->deviceFingerprint();
     }
 }
