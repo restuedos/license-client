@@ -3,6 +3,7 @@
 namespace Edzero\LicenseClient;
 
 use Edzero\LicenseClient\Commands\LicenseActivateCommand;
+use Edzero\LicenseClient\Commands\LicenseHeartbeatCommand;
 use Edzero\LicenseClient\Http\Middleware\EnsureLicenseIsValid;
 use Edzero\LicenseClient\Services\LicenseService;
 use Illuminate\Routing\Router;
@@ -35,6 +36,7 @@ class LicenseClientServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 LicenseActivateCommand::class,
+                LicenseHeartbeatCommand::class,
             ]);
         }
     }
